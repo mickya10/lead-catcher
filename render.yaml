@@ -1,0 +1,11 @@
+services:
+  - type: web
+    name: lead-catcher
+    runtime: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn -w 1 -b 0.0.0.0:$PORT app:app
+    healthCheckPath: /health
+    envVars:
+      - key: LEADS_DB
+        value: /tmp/leads.db
