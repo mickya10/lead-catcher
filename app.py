@@ -11,6 +11,9 @@ app = Flask(__name__)
 DB_PATH = os.environ.get("LEADS_DB", os.path.join(os.path.dirname(__file__), "leads.db"))
 REQUIRED_FIELDS = [f for f in os.environ.get("REQUIRED_FIELDS", "fullName,email,zip").split(",") if f]
 OPTIONAL_FIELDS = [f for f in os.environ.get("OPTIONAL_FIELDS", "phone").split(",") if f]
+# Recognized tracking fields passed through by the ad platform (e.g. Taboola click id).
+# Never flagged as extra, never reported missing.
+PASSTHROUGH_FIELDS = [f for f in os.environ.get("PASSTHROUGH_FIELDS", "tblci").split(",") if f]
 
 
 def db():
@@ -69,7 +72,7 @@ def validate(payload):
     present = set(payload.keys())
     missing_required = [f for f in REQUIRED_FIELDS if f not in present]
     missing_optional = [f for f in OPTIONAL_FIELDS if f not in present]
-    known = set(REQUIRED_FIELDS) | set(OPTIONAL_FIELDS)
+    known = set(REQUIRED_FIELDS) | set(OPTIONAL_FIELDS) | set(PASSTHROUGH_FIELDS)
     extra = sorted(present - known - {"_raw"})
     return {
         "ok": not missing_required,
@@ -222,7 +225,7 @@ def dashboard():
     return render_template_string(
         DASHBOARD,
         required=", ".join(REQUIRED_FIELDS),
-        optional=", ".join(OPTIONAL_FIELDS),
+        optional=", ".join(OPTIONAL_FIELDS + PASSTHROUGH_FIELDS),
     )
 
 
