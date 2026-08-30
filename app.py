@@ -3,8 +3,10 @@ import os
 import sqlite3
 import time
 from datetime import datetime, timezone
+from urllib.parse import urlencode
 
-from flask import Flask, g, jsonify, render_template_string, request
+import requests
+from flask import Flask, g, jsonify, redirect, render_template_string, request
 
 app = Flask(__name__)
 
@@ -14,6 +16,10 @@ OPTIONAL_FIELDS = [f for f in os.environ.get("OPTIONAL_FIELDS", "phone").split("
 # Recognized tracking fields passed through by the ad platform (e.g. Taboola click id).
 # Never flagged as extra, never reported missing.
 PASSTHROUGH_FIELDS = [f for f in os.environ.get("PASSTHROUGH_FIELDS", "tblci").split(",") if f]
+
+S2S_CONVERSION_URL = os.environ.get("S2S_CONVERSION_URL", "https://trc.taboola.com/actions-handler/log/3/s2s-action")
+S2S_CONVERSION_NAME = os.environ.get("S2S_CONVERSION_NAME", "LeadGenTest")
+S2S_TIMEOUT_SECONDS = 5
 
 
 def db():
@@ -30,9 +36,17 @@ def db():
                 user_agent   TEXT,
                 content_type TEXT,
                 payload      TEXT,
-                validation   TEXT
+                validation   TEXT,
+                query_params TEXT,
+                s2s          TEXT
             )
         """)
+        # existing db file from an older schema: add the new columns in place
+        for column in ("query_params", "s2s"):
+            try:
+                g.db.execute(f"ALTER TABLE leads ADD COLUMN {column} TEXT")
+            except sqlite3.OperationalError:
+                pass
     return g.db
 
 
@@ -97,11 +111,14 @@ def leads():
 
     payload, ctype = parse_body()
     verdict = validate(payload)
+    query_params = request.args.to_dict(flat=True)
+    tblci = payload.get("tblci") if isinstance(payload.get("tblci"), str) else None
+    s2s_result = fire_s2s_conversion(tblci)
 
     conn = db()
     cur = conn.execute(
-        "INSERT INTO leads (received_at, remote_ip, origin, referer, user_agent, content_type, payload, validation) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        "INSERT INTO leads (received_at, remote_ip, origin, referer, user_agent, content_type, payload, validation, query_params, s2s) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         (
             datetime.now(timezone.utc).isoformat(timespec="seconds"),
             request.headers.get("X-Forwarded-For", request.remote_addr),
@@ -111,10 +128,34 @@ def leads():
             ctype,
             json.dumps(payload, ensure_ascii=False),
             json.dumps(verdict),
+            json.dumps(query_params, ensure_ascii=False),
+            json.dumps(s2s_result) if s2s_result else None,
         ),
     )
     conn.commit()
-    return jsonify({"status": "ok", "id": cur.lastrowid, "validation": verdict}), 200
+
+    if request.args.get("redir") == "true":
+        thank_you_url = "/thanks" + ("?" + urlencode({"tblci": tblci}) if tblci else "")
+        # a real HTML form submit should navigate; a fetch/XHR JSON client
+        # gets the url in the response and navigates itself
+        if "json" not in ctype:
+            return redirect(thank_you_url, code=303)
+        return jsonify({"status": "ok", "id": cur.lastrowid, "validation": verdict,
+                        "thankYouUrl": thank_you_url, "s2s": s2s_result}), 200
+
+    return jsonify({"status": "ok", "id": cur.lastrowid, "validation": verdict, "s2s": s2s_result}), 200
+
+
+def fire_s2s_conversion(tblci):
+    if not tblci:
+        return None
+    params = {"click-id": tblci, "name": S2S_CONVERSION_NAME}
+    url = S2S_CONVERSION_URL + "?" + urlencode(params)
+    try:
+        resp = requests.get(url, timeout=S2S_TIMEOUT_SECONDS)
+        return {"url": url, "status": resp.status_code, "ok": resp.ok}
+    except requests.RequestException as e:
+        return {"url": url, "status": None, "ok": False, "error": type(e).__name__}
 
 
 @app.route("/leads.json")
@@ -126,6 +167,8 @@ def leads_json():
         d = dict(r)
         d["payload"] = json.loads(d["payload"])
         d["validation"] = json.loads(d["validation"])
+        d["query_params"] = json.loads(d["query_params"]) if d.get("query_params") else {}
+        d["s2s"] = json.loads(d["s2s"]) if d.get("s2s") else None
         out.append(d)
     return jsonify(out)
 
@@ -140,6 +183,40 @@ def clear():
 @app.route("/health")
 def health():
     return jsonify({"ok": True})
+
+
+THANKS = """<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Thank you</title>
+<style>
+  body { font: 16px/1.5 -apple-system, Segoe UI, sans-serif; margin: 0; background: #f7f8fa; color: #1a1a2e;
+         display: flex; align-items: center; justify-content: center; min-height: 100vh; }
+  .card { background: #fff; border: 1px solid #e3e5ea; border-radius: 12px; padding: 40px 48px; text-align: center;
+          box-shadow: 0 2px 10px rgba(0,0,0,.05); max-width: 560px; }
+  .check { font-size: 44px; }
+  h1 { font-size: 22px; margin: 12px 0 6px; }
+  p { color: #555; margin: 6px 0; }
+  code { background: #eef1f6; padding: 2px 8px; border-radius: 6px; font-size: 13px; word-break: break-all; }
+  .muted { color: #999; font-size: 13px; margin-top: 18px; }
+</style>
+</head>
+<body>
+<div class="card">
+  <div class="check">&#9989;</div>
+  <h1>Thank you!</h1>
+  <p>Your details were submitted successfully.</p>
+  {% if tblci %}<p class="muted">click id: <code>{{ tblci }}</code></p>{% endif %}
+</div>
+</body>
+</html>"""
+
+
+@app.route("/thanks")
+def thanks():
+    return render_template_string(THANKS, tblci=request.args.get("tblci"))
 
 
 DASHBOARD = """<!doctype html>
@@ -173,6 +250,7 @@ DASHBOARD = """<!doctype html>
 <table id="tbl">
   <thead><tr>
     <th>#</th><th>Received (UTC)</th><th>Validation</th><th>fullName</th><th>email</th><th>phone</th><th>zip</th>
+    <th>Query params</th><th>S2S conversion</th>
     <th>Content-Type</th><th>Origin / IP</th><th>Raw payload</th>
   </tr></thead>
   <tbody></tbody>
@@ -191,6 +269,13 @@ async function refresh() {
     const vtext = v.ok ? '<span class="pill ok">ok</span>'
       : '<span class="pill bad">missing: ' + v.missing_required.join(', ') + '</span>';
     const extra = (v.extra && v.extra.length) ? ' <span class="pill bad">extra: ' + v.extra.join(', ') + '</span>' : '';
+    const qp = l.query_params && Object.keys(l.query_params).length
+      ? '<pre>' + esc(JSON.stringify(l.query_params)) + '</pre>' : '';
+    let s2s = '';
+    if (l.s2s) {
+      s2s = l.s2s.ok ? '<span class="pill ok">fired: ' + l.s2s.status + '</span>'
+                     : '<span class="pill bad">failed: ' + esc(l.s2s.error || l.s2s.status) + '</span>';
+    }
     tr.innerHTML =
       '<td>' + l.id + '</td>' +
       '<td>' + l.received_at + '</td>' +
@@ -199,6 +284,8 @@ async function refresh() {
       '<td>' + esc(p.email) + '</td>' +
       '<td>' + esc(p.phone) + '</td>' +
       '<td>' + esc(p.zip) + '</td>' +
+      '<td>' + qp + '</td>' +
+      '<td>' + s2s + '</td>' +
       '<td>' + esc(l.content_type) + '</td>' +
       '<td>' + esc(l.origin || '') + '<br>' + esc(l.remote_ip) + '</td>' +
       '<td><pre>' + esc(JSON.stringify(p)) + '</pre></td>';
