@@ -6,13 +6,22 @@ from datetime import datetime, timezone
 from urllib.parse import urlencode
 
 import requests
+
+try:
+    import psycopg
+    from psycopg.rows import dict_row
+except ImportError:
+    psycopg = None
 from flask import Flask, g, jsonify, redirect, render_template_string, request
 
 app = Flask(__name__)
 
 DB_PATH = os.environ.get("LEADS_DB", os.path.join(os.path.dirname(__file__), "leads.db"))
+# Render's free disk is wiped on every spin-down and deploy; a DATABASE_URL (Postgres) keeps leads across them
+DATABASE_URL = os.environ.get("DATABASE_URL")
 REQUIRED_FIELDS = [f for f in os.environ.get("REQUIRED_FIELDS", "fullName,email,zip").split(",") if f]
-OPTIONAL_FIELDS = [f for f in os.environ.get("OPTIONAL_FIELDS", "phone").split(",") if f]
+OPTIONAL_FIELDS = [f for f in os.environ.get(
+    "OPTIONAL_FIELDS", "phone,street_address_1,street_address_2,city,state").split(",") if f]
 # Recognized tracking fields passed through by the ad platform (e.g. Taboola click id).
 # Never flagged as extra, never reported missing.
 PASSTHROUGH_FIELDS = [f for f in os.environ.get("PASSTHROUGH_FIELDS", "tblci").split(",") if f]
@@ -22,31 +31,59 @@ S2S_CONVERSION_NAME = os.environ.get("S2S_CONVERSION_NAME", "LeadGenTest")
 S2S_TIMEOUT_SECONDS = 5
 
 
+COLUMNS = ("received_at", "remote_ip", "origin", "referer", "user_agent", "content_type",
+           "payload", "validation", "query_params", "s2s")
+
+
+class Store:
+    def __init__(self):
+        self.pg = bool(DATABASE_URL)
+        if self.pg:
+            self.conn = psycopg.connect(DATABASE_URL, row_factory=dict_row, autocommit=True)
+            self.conn.execute(f"""
+                CREATE TABLE IF NOT EXISTS leads (
+                    id SERIAL PRIMARY KEY, {", ".join(c + " TEXT" for c in COLUMNS)}
+                )
+            """)
+        else:
+            self.conn = sqlite3.connect(DB_PATH)
+            self.conn.row_factory = sqlite3.Row
+            self.conn.execute(f"""
+                CREATE TABLE IF NOT EXISTS leads (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT, {", ".join(c + " TEXT" for c in COLUMNS)}
+                )
+            """)
+            # existing db file from an older schema: add the new columns in place
+            for column in ("query_params", "s2s"):
+                try:
+                    self.conn.execute(f"ALTER TABLE leads ADD COLUMN {column} TEXT")
+                except sqlite3.OperationalError:
+                    pass
+
+    def _sql(self, sql):
+        return sql.replace("?", "%s") if self.pg else sql
+
+    def insert(self, values):
+        sql = f"INSERT INTO leads ({', '.join(COLUMNS)}) VALUES ({', '.join('?' * len(COLUMNS))}) RETURNING id"
+        row = self.conn.execute(self._sql(sql), values).fetchone()
+        self.conn.commit()
+        return row["id"]
+
+    def latest(self, limit):
+        rows = self.conn.execute(self._sql("SELECT * FROM leads ORDER BY id DESC LIMIT ?"), (limit,)).fetchall()
+        return [dict(r) for r in rows]
+
+    def clear(self):
+        self.conn.execute("DELETE FROM leads")
+        self.conn.commit()
+
+    def close(self):
+        self.conn.close()
+
+
 def db():
     if "db" not in g:
-        g.db = sqlite3.connect(DB_PATH)
-        g.db.row_factory = sqlite3.Row
-        g.db.execute("""
-            CREATE TABLE IF NOT EXISTS leads (
-                id           INTEGER PRIMARY KEY AUTOINCREMENT,
-                received_at  TEXT NOT NULL,
-                remote_ip    TEXT,
-                origin       TEXT,
-                referer      TEXT,
-                user_agent   TEXT,
-                content_type TEXT,
-                payload      TEXT,
-                validation   TEXT,
-                query_params TEXT,
-                s2s          TEXT
-            )
-        """)
-        # existing db file from an older schema: add the new columns in place
-        for column in ("query_params", "s2s"):
-            try:
-                g.db.execute(f"ALTER TABLE leads ADD COLUMN {column} TEXT")
-            except sqlite3.OperationalError:
-                pass
+        g.db = Store()
     return g.db
 
 
@@ -96,10 +133,13 @@ def validate(payload):
     }
 
 
-@app.route("/leads", methods=["POST", "OPTIONS"])
+@app.route("/leads", methods=["GET", "POST", "OPTIONS"])
 def leads():
     if request.method == "OPTIONS":
         return "", 204
+    # a client that opens submitUrl in the browser after posting lands here; show the thank-you page, not a 405
+    if request.method == "GET":
+        return render_template_string(THANKS, tblci=request.args.get("tblci"))
 
     simulate = request.args.get("simulate")
     if simulate == "timeout":
@@ -115,24 +155,18 @@ def leads():
     tblci = payload.get("tblci") if isinstance(payload.get("tblci"), str) else None
     s2s_result = fire_s2s_conversion(tblci)
 
-    conn = db()
-    cur = conn.execute(
-        "INSERT INTO leads (received_at, remote_ip, origin, referer, user_agent, content_type, payload, validation, query_params, s2s) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-        (
-            datetime.now(timezone.utc).isoformat(timespec="seconds"),
-            request.headers.get("X-Forwarded-For", request.remote_addr),
-            request.headers.get("Origin"),
-            request.headers.get("Referer"),
-            request.headers.get("User-Agent"),
-            ctype,
-            json.dumps(payload, ensure_ascii=False),
-            json.dumps(verdict),
-            json.dumps(query_params, ensure_ascii=False),
-            json.dumps(s2s_result) if s2s_result else None,
-        ),
-    )
-    conn.commit()
+    lead_id = db().insert((
+        datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        request.headers.get("X-Forwarded-For", request.remote_addr),
+        request.headers.get("Origin"),
+        request.headers.get("Referer"),
+        request.headers.get("User-Agent"),
+        ctype,
+        json.dumps(payload, ensure_ascii=False),
+        json.dumps(verdict),
+        json.dumps(query_params, ensure_ascii=False),
+        json.dumps(s2s_result) if s2s_result else None,
+    ))
 
     if request.args.get("redir") == "true":
         thank_you_url = "/thanks" + ("?" + urlencode({"tblci": tblci}) if tblci else "")
@@ -140,10 +174,10 @@ def leads():
         # gets the url in the response and navigates itself
         if "json" not in ctype:
             return redirect(thank_you_url, code=303)
-        return jsonify({"status": "ok", "id": cur.lastrowid, "validation": verdict,
+        return jsonify({"status": "ok", "id": lead_id, "validation": verdict,
                         "thankYouUrl": thank_you_url, "s2s": s2s_result}), 200
 
-    return jsonify({"status": "ok", "id": cur.lastrowid, "validation": verdict, "s2s": s2s_result}), 200
+    return jsonify({"status": "ok", "id": lead_id, "validation": verdict, "s2s": s2s_result}), 200
 
 
 def fire_s2s_conversion(tblci):
@@ -161,10 +195,8 @@ def fire_s2s_conversion(tblci):
 @app.route("/leads.json")
 def leads_json():
     limit = min(int(request.args.get("limit", 100)), 1000)
-    rows = db().execute("SELECT * FROM leads ORDER BY id DESC LIMIT ?", (limit,)).fetchall()
     out = []
-    for r in rows:
-        d = dict(r)
+    for d in db().latest(limit):
         d["payload"] = json.loads(d["payload"])
         d["validation"] = json.loads(d["validation"])
         d["query_params"] = json.loads(d["query_params"]) if d.get("query_params") else {}
@@ -175,14 +207,13 @@ def leads_json():
 
 @app.route("/clear", methods=["POST"])
 def clear():
-    db().execute("DELETE FROM leads")
-    db().commit()
+    db().clear()
     return jsonify({"status": "cleared"})
 
 
 @app.route("/health")
 def health():
-    return jsonify({"ok": True})
+    return jsonify({"ok": True, "store": "postgres" if DATABASE_URL else "sqlite"})
 
 
 THANKS = """<!doctype html>
@@ -249,7 +280,7 @@ DASHBOARD = """<!doctype html>
 <span id="count" class="muted"></span>
 <table id="tbl">
   <thead><tr>
-    <th>#</th><th>Received (UTC)</th><th>Validation</th><th>fullName</th><th>email</th><th>phone</th><th>zip</th>
+    <th>#</th><th>Received (UTC)</th><th>Validation</th><th>fullName</th><th>email</th><th>phone</th><th>zip</th><th>address</th>
     <th>Query params</th><th>S2S conversion</th>
     <th>Content-Type</th><th>Origin / IP</th><th>Raw payload</th>
   </tr></thead>
@@ -284,6 +315,7 @@ async function refresh() {
       '<td>' + esc(p.email) + '</td>' +
       '<td>' + esc(p.phone) + '</td>' +
       '<td>' + esc(p.zip) + '</td>' +
+      '<td>' + esc([p.street_address_1, p.street_address_2, p.city, p.state].filter(x => x).join(', ')) + '</td>' +
       '<td>' + qp + '</td>' +
       '<td>' + s2s + '</td>' +
       '<td>' + esc(l.content_type) + '</td>' +

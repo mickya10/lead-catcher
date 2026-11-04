@@ -9,6 +9,7 @@ stores it, and shows a live dashboard.
 | Endpoint | What |
 |---|---|
 | `POST /leads` | Accepts JSON **or** form-urlencoded body. CORS wide-open (+ OPTIONS preflight). Returns `{status, id, validation}`. |
+| `GET /leads` | Thank-you page, for clients that open `submitUrl` in the browser after posting (used to be a 405). |
 | `GET /` | Live dashboard (auto-refresh, per-lead validation verdict, raw payload, Clear button). |
 | `GET /leads.json` | Machine-readable list (newest first) for test assertions. |
 | `POST /clear` | Wipe all stored leads. |
@@ -33,9 +34,11 @@ python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
 2. Render dashboard → New → Blueprint → pick the repo (`render.yaml` drives it).
 3. Note the public URL, e.g. `https://lead-catcher.onrender.com`.
 
-Storage caveat: Render's free tier has an **ephemeral disk** — SQLite survives
-idle wake-ups while the instance lives, but resets on deploy/restart. Fine for
-a test harness; don't treat it as durable.
+Storage: with `DATABASE_URL` set (the blueprint wires a free Render Postgres,
+`lead-catcher-db`) leads survive spin-downs and deploys. Without it the app falls
+back to SQLite at `LEADS_DB`, which Render's ephemeral disk wipes on every
+spin-down/deploy. Render's free Postgres expires 30 days after creation, and a
+workspace gets only one.
 
 ## Keep it awake
 
